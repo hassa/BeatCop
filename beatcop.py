@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 ## Python 2.7
-"""Beatcop tries to ensure that a specified task runs on exactly one node in a cluster.
+"""Beatcop tries to ensure that a specified process runs on exactly one node in a cluster.
 It does this by acquiring an expiring lock in Redis, which it then continually refreshes.
 If the node stops refreshing its lock for any reason (like sudden death) another will acquire the lock and launch the specified process.
 
@@ -87,7 +87,7 @@ class BeatCop(object):
         log.info("Waiting for lock, currently held by %s", self.lock.who())
         if self.lock.acquire():
             log.info("Lock acquired")
-            # We got the lock, so we make sure the task is running and keep refreshing the lock - if we ever stop for any reason, for example because our host died, the lock will soon expire.
+            # We got the lock, so we make sure the process is running and keep refreshing the lock - if we ever stop for any reason, for example because our host died, the lock will soon expire.
             while True:
                 if self.process is None:  # Process not spawned yet
                     self.process = self.spawn(self.command)
@@ -96,12 +96,12 @@ class BeatCop(object):
                 if child_status is not None:
                     # Oops, process died on us.
                     log.error("Child died with exit code %d", child_status)
-                    sys.exit(2)
-                # Everything okay, refresh lock and sleep
+                    sys.exit(1)
+                # Refresh lock and sleep
                 if not self.lock.refresh():
-                    log.error("Log refresh failed, bailing out")
+                    log.error("Lock refresh failed, bailing out (Lock now held by %s)", self.lock.who())
                     self.cleanup()
-                    sys.exit(66)
+                    sys.exit(os.EX_UNAVAILABLE)
                 time.sleep(self.sleep)
 
     def spawn(self, command):
@@ -113,7 +113,7 @@ class BeatCop(object):
         return subprocess.Popen(args, shell=self.shell)
 
     def cleanup(self):
-        """Clean up, making sure the task is stopped before we pack up and go home."""
+        """Clean up, making sure the process is stopped before we pack up and go home."""
         if self.process is None:  # Process wasn't running yet, so nothing to worry about
             return
         if self.process.poll() is None:
@@ -137,21 +137,24 @@ class BeatCop(object):
         if sig in [signal.SIGTERM]:
             log.warning("SIGTERM received, shutting down...")
         self.cleanup()
-        sys.exit(1)
+        sys.exit(-sig)
 
     def crash(self):
         """Handles unexpected exit, for example because Redis connection failed."""
-        log.error("Something went terribly wrong")
         self.cleanup()
 
 
 if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        print "Usage: %s <ini_file>" % sys.argv[0]
+        sys.exit(os.EX_USAGE)
+    config_file = sys.argv[1]
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s BeatCop: %(message)s', datefmt='%Y-%m-%d %H:%M:%S %Z')
     log = logging.getLogger()
 
     conf = ConfigParser.ConfigParser()
-    conf.read('beatcop.ini')
+    conf.read(config_file)
     beatcop = BeatCop(
         conf.get('beatcop', 'command'),
         redis_host=conf.get('redis', 'host'),
