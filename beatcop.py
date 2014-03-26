@@ -37,18 +37,21 @@ class Lock(object):
         self.name = name
         self.timeout = timeout
         self.sleep = sleep
-        # Instead of putting any old rubbish into the Lock's value, use our IP address and PID
-        self.value = "%s-%d" % (socket.gethostbyname(socket.gethostname()), os.getpid())
+        # Instead of putting any old rubbish into the Lock's value, use our FQDN and PID
+        self.value = "%s-%d" % (socket.getfqdn(), os.getpid())
         self._refresh_script = self.redis.register_script(self.lua_refresh)
 
-    def acquire(self):
-        """Acquire lock. Blocks until acquired."""
+    def acquire(self, block=True):
+        """Acquire lock. Blocks until acquired if `block` is `True`, otherwise returns `False` if the lock could not be acquired."""
         while True:
             # Try to set the lock
             if self.redis.set(self.name, self.value, px=self.timeout, nx=True):
                 # It's ours until the timeout now
                 return True
-            # Lock is taken, try again in a bit
+            # Lock is taken
+            if not block:
+                return False
+            # If blocking, try again in a bit
             time.sleep(self.sleep)
 
     def refresh(self):
@@ -59,7 +62,7 @@ class Lock(object):
         return self._refresh_script(keys=[self.name], args=[self.value, self.timeout]) == 1
 
     def who(self):
-        """Returns the owner (value) of the lock."""
+        """Returns the owner (value) of the lock or `None` if there isn't one."""
         return self.redis.get(self.name)
 
 
@@ -72,7 +75,10 @@ class BeatCop(object):
         self.timeout = timeout
         self.sleep = timeout / (1000.0 * 3)  # Convert to seconds and make sure we refresh at least 3 times per timeout period
         self.process = None
-        self.redis = redis.Redis(host=redis_host, port=redis_port, db=0)
+        if "/" in redis_host:
+            self.redis = redis.Redis(unix_socket_path=redis_host, db=0)
+        else:
+            self.redis = redis.Redis(host=redis_host, port=redis_port, db=0)
         self.lockname = lockname or ("beatcop:%s" % (self.command))
         self.lock = Lock(self.redis, self.lockname, timeout=self.timeout, sleep=self.sleep)
 
@@ -99,9 +105,18 @@ class BeatCop(object):
                     sys.exit(1)
                 # Refresh lock and sleep
                 if not self.lock.refresh():
-                    log.error("Lock refresh failed, bailing out (Lock now held by %s)", self.lock.who())
-                    self.cleanup()
-                    sys.exit(os.EX_UNAVAILABLE)
+                    who = self.lock.who()
+                    if who is None:
+                        if self.lock.acquire(block=False):
+                            log.warning("Lock refresh failed, but successfully re-acquired unclaimed lock")
+                        else:
+                            log.error("Lock refresh and subsequent re-acquire failed, giving up (Lock now held by %s)", self.lock.who())
+                            self.cleanup()
+                            sys.exit(os.EX_UNAVAILABLE)
+                    else:
+                        log.error("Lock refresh failed, %s stole it - bailing out", self.lock.who())
+                        self.cleanup()
+                        sys.exit(os.EX_UNAVAILABLE)
                 time.sleep(self.sleep)
 
     def spawn(self, command):
