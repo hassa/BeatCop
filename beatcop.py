@@ -79,6 +79,14 @@ class BeatCop(object):
             self.redis = redis.Redis(unix_socket_path=redis_host, db=0)
         else:
             self.redis = redis.Redis(host=redis_host, port=redis_port, db=0)
+        try:
+            redis_info = self.redis.info()
+        except redis.exceptions.ConnectionError as e:
+            log.error("Couldn't connect to Redis: %s", e.message)
+            sys.exit(os.EX_NOHOST)
+        if reduce(lambda l,r: l*1000+r, map(int,redis_info['redis_version'].split('.'))) < 2006012:
+            log.error("Redis too old. You got %s, minimum requirement is %s", redis_info['redis_version'], '2.6.12')
+            sys.exit(os.EX_PROTOCOL)
         self.lockname = lockname or ("beatcop:%s" % (self.command))
         self.lock = Lock(self.redis, self.lockname, timeout=self.timeout, sleep=self.sleep)
 
