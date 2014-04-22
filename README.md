@@ -21,7 +21,6 @@ Prerequisites
 
  * A server running Redis 2.6.12 or higher to which all nodes can connect.
 
- * 
 Installation
 ============
 
