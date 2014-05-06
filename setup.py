@@ -9,4 +9,4 @@ setup(name='BeatCop',
       url='https://github.com/Luluvise/BeatCop',
       requires=['redis(>=2.9.1)'],
       scripts=['beatcop.py'],
-     )
+)
