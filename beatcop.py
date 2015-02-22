@@ -69,16 +69,16 @@ class Lock(object):
 class BeatCop(object):
     """Run a process on a single node by using a Redis lock."""
 
-    def __init__(self, command, redis_host, redis_port=6379, lockname=None, timeout=1000, shell=False):
+    def __init__(self, command, redis_host, redis_port=6379, redis_db=0, redis_password=None, lockname=None, timeout=1000, shell=False):
         self.command = command
         self.shell = shell
         self.timeout = timeout
         self.sleep = timeout / (1000.0 * 3)  # Convert to seconds and make sure we refresh at least 3 times per timeout period
         self.process = None
         if "/" in redis_host:
-            self.redis = redis.Redis(unix_socket_path=redis_host, db=0)
+            self.redis = redis.Redis(unix_socket_path=redis_host, db=redis_db, password=redis_password)
         else:
-            self.redis = redis.Redis(host=redis_host, port=redis_port, db=0)
+            self.redis = redis.Redis(host=redis_host, port=redis_port, db=redis_db, password=redis_password)
         try:
             redis_info = self.redis.info()
         except redis.exceptions.ConnectionError as e:
@@ -182,6 +182,8 @@ if __name__ == '__main__':
         conf.get('beatcop', 'command'),
         redis_host=conf.get('redis', 'host'),
         redis_port=conf.getint('redis', 'port'),
+	redis_db=conf.get('redis', 'database') if conf.has_option('redis', 'database') else None,
+	redis_password=conf.get('redis', 'password') if conf.has_option('redis', 'password') else None,
         lockname=conf.get('beatcop', 'lockname') if conf.has_option('beatcop', 'lockname') else None,
         timeout=conf.getint('beatcop', 'timeout'),
         shell=conf.getboolean('beatcop', 'shell'),
