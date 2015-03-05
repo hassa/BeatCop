@@ -3,7 +3,7 @@ BeatCop
 
 BeatCop is a simple cluster singleton manager. It ensures that a managed process runs on exactly one node in a cluster at a time, no more, no less (assuming there is at least one node left alive).
 
-It was written for managing [Celery beat](http://celery.readthedocs.org/en/latest/userguide/periodic-tasks.html) in an autoscaling pool of Celery workers but was written as generic process manager and can therefore be used for pretty much anything. It uses [Redis](http://redis.io/) to communicate.
+It was created for managing [Celery beat](http://celery.readthedocs.org/en/latest/userguide/periodic-tasks.html) in an autoscaling pool of Celery workers but was written as generic process manager and can therefore be used for pretty much anything. It uses [Redis](http://redis.io/) to communicate.
 
 
 Mechanism
@@ -34,13 +34,13 @@ It is typically a good idea to run BeatCop in something that will restart it if 
 Configuration
 -------------
 
-See sample `beatcop.ini`.
+See example `beatcop.ini`.
 
 
 Caveats
 -------
 
-BeatCop relies on Redis connectivity. If Redis updates fail, BeatCop will stop the controlled process and exit, hoping that at least one other node can still talk to Redis and spawn a new process. If all nodes lose Redis connectivity, this will obviously fail.
+BeatCop relies on Redis connectivity. If Redis updates fail, BeatCop will stop the controlled process and exit, hoping that at least one other node can still talk to Redis and spawn a new process. If all nodes lose Redis connectivity, this will obviously fail. BeatCop now supports Redis Cluster (see example `beatcop.ini`), which means Redis no longer has to be the single point of failure.
 
 BeatCop does not currently work via [nutcracker (twemproxy)](https://github.com/twitter/twemproxy/blob/master/notes/redis.md#scripting).
 

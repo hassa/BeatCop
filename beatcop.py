@@ -19,6 +19,17 @@ import subprocess
 import sys
 import time
 
+try:
+    import rediscluster
+
+    # In redis-py-cluster 0.2.0 this hasn't been renamed yet. This check can go once a newer version is released.
+    if hasattr(rediscluster, 'StrictRedisCluster'):
+        RedisCluster = rediscluster.StrictRedisCluster
+    else:
+        RedisCluster = rediscluster.RedisCluster
+except ImportError:
+    pass
+
 
 class Lock(object):
     """Lock class using Redis expiry."""
@@ -39,7 +50,11 @@ class Lock(object):
         self.sleep = sleep
         # Instead of putting any old rubbish into the Lock's value, use our FQDN and PID
         self.value = "%s-%d" % (socket.getfqdn(), os.getpid())
-        self._refresh_script = self.redis.register_script(self.lua_refresh)
+        # rediscluster does not yet implement script management
+        try:
+            self._refresh_script = self.redis.register_script(self.lua_refresh)
+        except rediscluster.exceptions.RedisClusterException:    # 'Method register_script is not possible to use in a redis cluster'
+            pass
 
     def acquire(self, block=True):
         """Acquire lock. Blocks until acquired if `block` is `True`, otherwise returns `False` if the lock could not be acquired."""
@@ -58,8 +73,14 @@ class Lock(object):
         """Refresh an existing lock to prevent it from expiring.
         Uses a LUA (EVAL) script to ensure only a lock which we own is being overwritten.
         Returns True if refresh succeeded, False if not."""
+        keys = [self.name]
+        args = [self.value, self.timeout]
         # Redis docs claim EVALs are atomic, and I'm inclined to believe it.
-        return self._refresh_script(keys=[self.name], args=[self.value, self.timeout]) == 1
+        if hasattr(self, '_refresh_script'):
+            return self._refresh_script(keys=keys, args=args) == 1
+        else:
+            keys_and_args = keys + args
+            return self.redis.eval(self.lua_refresh, len(keys), *keys_and_args)
 
     def who(self):
         """Returns the owner (value) of the lock or `None` if there isn't one."""
@@ -69,22 +90,43 @@ class Lock(object):
 class BeatCop(object):
     """Run a process on a single node by using a Redis lock."""
 
-    def __init__(self, command, redis_host, redis_port=6379, redis_db=0, redis_password=None, lockname=None, timeout=1000, shell=False):
+    def __init__(self, command, redis_host_or_startup_nodes, redis_port=6379, redis_db=0, redis_password=None, lockname=None, timeout=1000, shell=False):
         self.command = command
         self.shell = shell
         self.timeout = timeout
         self.sleep = timeout / (1000.0 * 3)  # Convert to seconds and make sure we refresh at least 3 times per timeout period
         self.process = None
-        if "/" in redis_host:
-            self.redis = redis.Redis(unix_socket_path=redis_host, db=redis_db, password=redis_password)
+        redis_kwargs = dict(
+            password=redis_password
+        )
+        if redis_db:
+            redis_kwargs.update(dict(
+                db=redis_db
+            ))
+        if isinstance(redis_host_or_startup_nodes, list):
+            redis_kwargs.update(dict(
+                startup_nodes=redis_host_or_startup_nodes
+            ))
+            log.info("BeatCop will connect to a Redis Cluster.")
+        elif "/" in redis_host_or_startup_nodes:
+            redis_kwargs.update(dict(
+                unix_socket_path=redis_host_or_startup_nodes
+            ))
+            log.info("BeatCop will connect to single Redis instance via Unix domain socket.")
         else:
-            self.redis = redis.Redis(host=redis_host, port=redis_port, db=redis_db, password=redis_password)
+            redis_kwargs.update(dict(
+                host=redis_host_or_startup_nodes,
+                port=redis_port
+            ))
+            log.info("BeatCop will connect to single Redis instance via TCP.")
+        self.redis = Redis(**redis_kwargs)
         try:
             redis_info = self.redis.info()
         except redis.exceptions.ConnectionError as e:
             log.error("Couldn't connect to Redis: %s", e.message)
             sys.exit(os.EX_NOHOST)
-        if reduce(lambda l,r: l*1000+r, map(int,redis_info['redis_version'].split('.'))) < 2006012:
+        # Check Redis version. The 'redis_version' key is absent in Redis Cluster, because redis_info is a dict of cluster nodes instead. In which case our Redis is definitely new enough.
+        if 'redis_version' in redis_info and reduce(lambda l,r: l*1000+r, map(int,redis_info['redis_version'].split('.'))) < 2006012:
             log.error("Redis too old. You got %s, minimum requirement is %s", redis_info['redis_version'], '2.6.12')
             sys.exit(os.EX_PROTOCOL)
         self.lockname = lockname or ("beatcop:%s" % (self.command))
@@ -100,7 +142,7 @@ class BeatCop(object):
 
         log.info("Waiting for lock, currently held by %s", self.lock.who())
         if self.lock.acquire():
-            log.info("Lock acquired")
+            log.info("Lock '%s' acquired", self.lockname)
             # We got the lock, so we make sure the process is running and keep refreshing the lock - if we ever stop for any reason, for example because our host died, the lock will soon expire.
             while True:
                 if self.process is None:  # Process not spawned yet
@@ -176,18 +218,41 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s BeatCop: %(message)s', datefmt='%Y-%m-%d %H:%M:%S %Z')
     log = logging.getLogger()
 
-    conf = ConfigParser.ConfigParser()
+    conf = ConfigParser.SafeConfigParser()
     conf.read(config_file)
-    beatcop = BeatCop(
-        conf.get('beatcop', 'command'),
-        redis_host=conf.get('redis', 'host'),
-        redis_port=conf.getint('redis', 'port'),
-	redis_db=conf.get('redis', 'database') if conf.has_option('redis', 'database') else None,
-	redis_password=conf.get('redis', 'password') if conf.has_option('redis', 'password') else None,
-        lockname=conf.get('beatcop', 'lockname') if conf.has_option('beatcop', 'lockname') else None,
+    sections = conf.sections()
+
+    # Config sanity check
+    if conf.has_option('redis', 'host') and conf.has_option('redis', 'startup_nodes'):
+        log.error("[redis] section of ini_file must specify one of 'host' or 'startup_nodes', not both.")
+        sys.exit(os.EX_CONFIG)
+    if not conf.has_option('redis', 'host') and not conf.has_option('redis', 'startup_nodes'):
+        log.error("[redis] section of ini_file must specify either 'host' or 'startup_nodes' section. Didn't find either.")
+        sys.exit(os.EX_CONFIG)
+
+    if conf.has_option('redis', 'host'):
+        # Single Redis mode
+        redis_host_or_startup_nodes = conf.get('redis', 'host')
+        Redis = redis.StrictRedis
+    else:
+        # Redis Cluster mode
+        redis_host_or_startup_nodes = [dict(host=node.split(':')[0], port=node.split(':')[1]) for node in conf.get('redis', 'startup_nodes').split('\n')]
+        Redis = RedisCluster
+
+    beatcop_kwargs = dict(
+        redis_host_or_startup_nodes=redis_host_or_startup_nodes,
         timeout=conf.getint('beatcop', 'timeout'),
         shell=conf.getboolean('beatcop', 'shell'),
     )
+    if conf.has_option('redis', 'port'):
+        beatcop_kwargs.update(dict(redis_port=conf.getint('redis', 'port')))
+    if conf.has_option('redis', 'database'):
+        beatcop_kwargs.update(dict(redis_db=conf.get('redis', 'database')))
+    if conf.has_option('redis', 'password'):
+        beatcop_kwargs.update(dict(redis_password=conf.get('redis', 'password')))
+    if conf.has_option('beatcop', 'lockname'):
+        beatcop_kwargs.update(dict(lockname=conf.get('beatcop', 'lockname')))
+    beatcop = BeatCop(conf.get('beatcop', 'command'), **beatcop_kwargs)
 
     log.info("BeatCop starting on %s using lock '%s'", beatcop.lock.value, beatcop.lockname)
     beatcop.run()
